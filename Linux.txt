@@ -1,0 +1,47 @@
+# Просмотр содержимого и разрешений папки
+- а отображать файлы, включая скрытые
+- l выводить подробный список
+-- color добавить цвет
+
+# Изменение прав доступа к папке
+Категории пользователей: u(владелец),g(пользователи группы),o(остальные пользователи),a(все)
+Права доступа: rwx(чтение, запись, выполнение)
+
+student:~$ chmod u=rwx /home/timewebtest
+
+# Изменение владельца 
+student:~$ chown -R postgres:postgres /var/lib/postgresql/13/beta
+-R рекурсивное применение
+
+# Копирование файлов в директорию
+student:~$ cp -r /home/student/backup/* /var/lib/postgresql/13/beta
+-r рекурсивное копирование файлов и папок из директории /home/student/backup
+
+# Поиск строк, удовлетворяющих шаблону
+student:~$ grep -e "primary_*" -e "hot_*" /var/lib/postgresql/13/beta/postgresql.auto.conf
+
+# Вывод на экран
+student:~$ cat /var/lib/postgresql/13/beta/postgresq.auto.conf
+
+# Перемещение папок и файлов
+student:~$ mv /home/student/backup /var/lib/postgresql/13/beta
+
+# Переименование папки backup в папку backup_new
+student:~$ mv /home/student/backup /home/student/backup_new
+
+# Удаление непустой папки с файлами
+student:~$ rm -Rfv /var/lib/postgresql/13/beta
+-R рекурсивное удаление файлов
+-f разрешает удаление файлов без запроса
+-v показывает имена удаляемых файлов
+
+student:~$ rm -i /var/lib/postgresql/13/beta/postgresql.auto.conf
+-i подтверждение удаления файла postgresql.auto.conf
+
+# Вывод строки текста в терминале
+student$ echo 'cluster_name=beta'
+
+#Сохранение вывода команд в выбранном источнике.
+
+student$ echo 'cluster_name=beta' | sudo tee -a /home/student/backup/postgresql.auto.conf
+- а добавляет информацию в конец файла, не перезаписывая его
