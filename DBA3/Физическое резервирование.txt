@@ -1,0 +1,67 @@
+# Физическое резервирование подразумевает копирование всех файлов, относящихся к кластеру БД, то есть создание полной двоичной копии.
+
+К плюсам относятся:
+- скорость восстановления из резервной копии
+- отсутствие необходимости в сборе статистики
+К минусам:
+- восстановление системы только на совместимой платформе(та же ОС, та же разрядность, тот же порядок байтов в представлении чисел, та же основная версия PostgreSQL)
+- невозможность созданий выборочной резервной копии баз данных кластера
+
+Для создания горячей резервной копии используется два инструмента: протокол репликации и слот репликации
+Протокол репликации - специальный протокол, используемый для репликации и резервного копирования. Журнальные записи передаются по протоколу репликации процессом wal sender. Количество процессов ограничено параметром max_wal_senders. Для подключения через протокол репликации роль должна обладать атрибутом REPLICATION(SUPERUSER). В pg_hba.conf надо разрешить подключение этой роли к базе данных replication.
+
+student=# SELECT type, database, user_name, address, auth_method
+FROM pg_hba_file_rules()
+WHERE 'replication' = ANY(database);
+ type  |   database    | user_name |  address  | auth_method 
+-------+---------------+-----------+-----------+-------------
+ local | {replication} | {all}     |           | trust
+ host  | {replication} | {all}     | 127.0.0.1 | md5
+ host  | {replication} | {all}     | ::1       | md5
+(3 rows)
+
+student=# \du student
+                                  List of roles
+ Role name |                   Attributes                   |      Member of   >
+-----------+------------------------------------------------+------------------>
+ student   | Superuser, Create role, Create DB, Replication | {pg_read_all_stat>
+ 
+ Слот репликации запоминает номер последней переданной клиенту записи и запрещает удаление сегментов WAL контрольными точками.
+ 
+ Если предполагается немедленно развернуть новый сервер из резервной копии, удобно вызывать pg_basebackup с форматом plain. Если же копия выполняется в рамках обычной политики резервного копирования, удобно воспользоваться форматом tar.
+ 
+student:~$ pg_basebackup --format=tar --pgdata=/home/student/backup --gzip --progress
+178170/178170 kB (100%), 2/2 tablespaces
+
+Создание ТП:
+student$ sudo mkdir /var/lib/postgresql/ts_dir
+student$ sudo chown postgres /var/lib/postgresql/ts_dir
+
+student$ psql -U postgres -c "CREATE TABLESPACE ts LOCATION '/var/lib/postgresql/ts_dir'"
+student$ psql -U postgres -c "ALTER TABLESPACE ts OWNER TO student"
+
+student=# create table abc(id integer, name text) tablespace ts; 
+student=# insert into abc values(1, 'Ken'),(2,'Barbie');
+
+Каталог для табличного пространства ts на сервере, который будет развернут из резервной копии:
+
+student$ sudo mkdir /var/lib/postgresql/ts_beta_dir
+Разворачиваем резервную копию:
+
+student$ sudo tar -zxf /home/student/backup/base.tar.gz -C /var/lib/postgresql/13/beta
+student$ sudo tar -zxf /home/student/backup/24576.tar.gz -C /var/lib/postgresql/ts_beta_dir
+student$ sudo tar -zxf /home/student/backup/pg_wal.tar.gz -C /var/lib/postgresql/13/beta/pg_wal
+Меняем владельца и разрешения:
+
+student$ sudo chown -R postgres /var/lib/postgresql/13/beta
+student$ sudo chmod -R 700 /var/lib/postgresql/13/beta
+student$ sudo chown -R postgres /var/lib/postgresql/ts_beta_dir
+
+Символическая ссылка появится при старте сервера в соответствии с файлом tablespace_map (который находился внутри base.tar):
+
+student$ sudo cat /var/lib/postgresql/13/beta/tablespace_map
+24576 /var/lib/postgresql/ts_dir
+Изменяем в этом файле путь для табличного пространства:
+student$ sudo sed -i 's/ts_dir/ts_beta_dir/' /var/lib/postgresql/13/beta/tablespace_map
+
+student$ sudo pg_ctlcluster 13 beta start

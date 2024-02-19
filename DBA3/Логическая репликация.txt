@@ -1,0 +1,63 @@
+Настройка репликации 
+
+# Слот репликации нужен для исключения возможности перезатирания сегментов журнала предзаписи перед их передачей на реплику. Если слот не создать, то при задержке репликации на мастере, часть сегментов wal будет утеряна и мастер с репликой потеряют согласованность.
+
+replication_db=# select pg_create_physical_replication_slot('replica')
+
+# Создание резервной копии утилитой pg_basebackup
+
+student:~$ pg_basebackup -D /home/student/backup --slot=replica -R 
+
+-R Создать файл standby.signal и добавить параметры конфигурации в файл postgresql.auto.conf в целевом каталоге.
+
+В файл postgresql.auto.conf будут записаны параметры соединения и слот репликации, если его использует pg_basebackup, так что впоследствии при потоковой репликации будут использоваться те же параметры.
+
+# Убеждаемся, что сервер реплики выключен
+
+student:~$ sudo pg_ctlcluster 13 beta status
+pg_ctl: no server running
+
+# Восстановление реплики из резервной копии
+
+student:~$ sudo rm -rf /var/lib/postgresql/13/beta
+student:~$ sudo mv /home/student/backup /var/lib/postgresql/13/beta
+student:~$ sudo chown -R postgres:postgres /var/lib/postgresql/13/beta
+
+# Убеждаемся, что на реплике подняты процессы walreceiver и startup
+
+student:~$ ps -o pid,command --ppid `sudo head -n 1 /var/lib/postgresql/13/beta/postmaster.pid`
+    PID COMMAND
+  10393 postgres: 13/beta: startup recovering 00000001000000000000002A
+  10394 postgres: 13/beta: checkpointer 
+  10395 postgres: 13/beta: background writer 
+  10396 postgres: 13/beta: stats collector 
+  10397 postgres: 13/beta: walreceiver streaming 0/2A000148
+
+Сравним с процессами на мастере
+student:~$ ps -o pid,command --ppid `sudo head -n 1 /var/lib/postgresql/13/beta/postmaster.pid`
+    PID COMMAND
+  10393 postgres: 13/beta: startup recovering 00000001000000000000002A
+  10394 postgres: 13/beta: checkpointer 
+  10395 postgres: 13/beta: background writer 
+  10396 postgres: 13/beta: stats collector 
+  10397 postgres: 13/beta: walreceiver streaming 0/2A000148
+
+# Проверяем репликацию, для этого на мастере выполняем вставку новых данных в таблицу master_t
+
+student:~$ psql -d replication_db -c "insert into master_t values('New line')"
+
+И проверим, что они появились на реплике
+
+student:~$ psql -p 5433 -d replication_db -c 'select * from master_t'
+
+# Настройка синхронной репликации.
+
+Для этого необходимо изменить параметры мастера synchronous_commit, synchronous_standby_names,а на реплике - cluster_name = beta.
+
+student$ echo 'synchronous_commit=on' | sudo tee -a /var/lib/postgresql/13/alpha/postgresql.auto.conf
+student$ echo 'synchronous_standby_names=beta' | sudo tee -a /var/lib/postgresql/13/alpha/postgresql.auto.conf
+student$ echo 'cluster_name=beta' | sudo tee -a /var/lib/postgresql/13/beta/postgresql.auto.conf
+
+и перечитать конфигурацию
+student:~$ sudo pg_ctlcluster 13 alpha reload
+student:~$ sudo pg_ctlcluster 13 beta reload
