@@ -1,0 +1,126 @@
+****************************************************************************************               Восстановление из архива журналов предзаписи. PITR                    *
+***************************************************************************************
+
+С помощью архива и базовой резервной копии можно восстанавливаться на произвольный момент времени. Ведение архива делает необязательным создание резервной копии со всеми журналами предзаписи из pg_wal, потому что все нужные для восстановления сегменты подтягиваются из архива. 
+
+student:~$ sudo mkdir /var/lib/postgresql/archive
+student:~$ sudo chown -R postgres:postgres /var/lib/postgresql/archive
+
+Существует два способа архивации:
+- непрерывная. Настраивается средствами СУБД
+- потоковая. Настраивается утилитой pg_receivewal, которая получает сегменты через протокол репликации
+
+*************************|  Настройка непрерывной архивации |**************************
+Включение процесса archiver
+α=> ALTER SYSTEM SET archive_mode = on;
+ALTER SYSTEM
+
+Задание простейшей команды archive_command, которая добавляет новый файл в архив, если он отсутствует
+α=> ALTER SYSTEM SET archive_command = 'test ! -f /var/lib/postgresql/archive/%f && cp %p /var/lib/postgresql/archive/%f';
+ALTER SYSTEM
+
+Если активность сервера низкая, то переключение на новый сегмент WAL можно задать параметром archive_timeout.
+
+student$ sudo pg_ctlcluster 13 alpha restart
+
+α=> SELECT pg_walfile_name(pg_current_wal_lsn());
+     pg_walfile_name      
+--------------------------
+ 00000003000000000000004D
+(1 row)
+
+Недостатком непрерывного архивирования является то, что сегменты WAL попадают в архив только после их полного заполнения, что чревато потерей данных, если содержимое pg_wal будет утеряно.
+
+α=> SELECT pg_switch_wal();
+
+student=# select * from pg_stat_archiver \gx
+-[ RECORD 1 ]------+------------------------------
+archived_count     | 4
+last_archived_wal  | 00000003000000000000004D
+last_archived_time | 2024-02-20 15:24:43.256453+03
+failed_count       | 0
+last_failed_wal    | 
+last_failed_time   | 
+stats_reset        | 2024-02-19 15:29:10.642286+03
+
+α=> ALTER SYSTEM RESET archive_mode;
+ALTER SYSTEM
+α=> ALTER SYSTEM RESET archive_command;
+ALTER SYSTEM
+student:~$ sudo pg_ctlcluster 13 alpha restart
+
+***********************|  Настройка потоковой архивации |******************************
+
+student:~$ sudo su -l postgres
+
+Утилита pg_receivewal работает по протоколу репликации, получая файлы от сервера и записывая их в указанную директорию. Чтобы гарантированно не потерять записи и не испортить архив пропусками, используется слот репликации.
+   
+α=> SELECT pg_create_physical_replication_slot('archive')
+postgres@student:~$ pg_receivewal --slot=archive --directory=/var/lib/postgresql/archive -v
+
+Теперь новые сегменты журнала будут сразу записываться в архив, не дожидаясь их заполнения. Еще не до конца заполненные сегменты отличаются префиксом .partial
+-rw------- 1 postgres postgres 16777216 мар  2 11:20 000000010000000000000007.partial
+
+Для прекращения потоковой архивации я сначала изменяю параметр wal_sender_timeout='10min'.
+student:~$ psql -c "alter system set wal_sender_timeout='10min'"
+
+Прерываю процесс с PID=10401
+student:~$ psql -U postgres -c "select pg_terminate_backend(10401)"
+
+Удаляю слот репликации
+student:~$ psql -c "select pg_drop_replication_slot('archive')"
+
+**************|  Восстановление на указанный момент времени. PITR  |*******************
+
+По умолчанию в процессе восстановления проигрываются все доступные журнальные файлы, но задав целевую точку, можно восстановиться на определенный момент времени.
+
+student:~$ psql -d backup
+
+backup=# select count(*) from t;
+ count  
+--------
+ 400000
+(1 row)
+backup=# select pg_current_wal_lsn();
+ pg_current_wal_lsn 
+--------------------
+ 0/6002278
+(1 row)
+
+backup=# delete from t where s > 0.5;
+DELETE 199598
+backup=# select pg_current_wal_lsn();
+ pg_current_wal_lsn 
+--------------------
+ 0/7886E30
+(1 row)
+
+Восстановление на момент времени, предшествующий удалению записей.
+student:~$ sudo -u postgres pg_basebackup --pgdata=/home/student/backup --wal-method=none --format=tar --gzip --username=postgres --label=bak1 --checkpoint=fast
+student:~$ sudo pg_ctlcluster 13 alpha stop
+student:~$ sudo rm -rf /var/lib/postgresql/13/alpha
+student:~$ sudo mkdir /var/lib/postgresql/13/alpha
+student:~$ sudo tar xzf /home/student/backup/base.tar.gz -C /var/lib/postgresql/13/alpha
+student:~$ sudo touch /var/lib/postgresql/13/alpha/recovery.signal
+student:~$cat << EOF | sudo tee /var/lib/postgresql/13/alpha/postgresql.auto.conf
+restore_command = 'cp /var/lib/postgresql/archive/%f %p'
+recovery_target_lsn = '0/6002278'
+EOF
+student:~$ sudo chown -R postgres:postgres /var/lib/postgresql/13/alpha
+student:~$ sudo chmod -R 700 /var/lib/postgresql/13/alpha
+student:~$ sudo pg_ctlcluster 13 alpha start
+
+Сейчас сервер работает в режиме recovery и не принимает подключения, давая возможность администратору проверить, успешность восстановления.
+student:~$ psql -d backup
+backup=# select count(*) from t;
+ count  
+--------
+ 400000
+(1 row)
+
+PITR прошло успешно, поэтому можно продолжить работу на сервере.
+student=# select pg_wal_replay_resume();
+student:~$ sudo pg_ctlcluster 13 alpha start
+student=> select pg_create_physical_replication_slot('archive');
+
+Цель восстановления указывается параметрами: recovery_target_time, recovery_target_xid, recovery_target_lsn. С помощью параметра recovery_target_inclusive можно включить или исключить саму точку.
