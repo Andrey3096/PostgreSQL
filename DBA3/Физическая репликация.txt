@@ -1,0 +1,79 @@
+******************************************************************************************************                                   Физическая репликация                                           *
+*****************************************************************************************************
+
+Репликация - синхронизация копий кластера баз данных на разных серверах. 
+Выполняется по двум причинам:
+- отказоустойчивость
+- масштабируемость
+Поток журнальных файлов однонаправлен от мастера к реплике. Реплика с мастером должны иметь двоичную совместимость из-за журнальных файлов, являющихся по сути фрагментами страниц, определяемых платформой.
+
+**********************************| Настройка репликации |******************************************* 
+
+Слот репликации исключает вероятность перезатирания сегментов WAL перед их передачей на реплику. Если слот не создать, то при задержках репликации на мастере, часть сегментов WAL может быть утеряна. Например, во время создания контрольной точки неиспользуемые сегменты стираются.
+
+replication_db=# SELECT pg_create_physical_replication_slot('replica');
+
+student=> SELECT * FROM pg_replication_slots \gx
+-[ RECORD 1 ]-------+----------
+slot_name           | replica
+plugin              | 
+slot_type           | physical
+datoid              | 
+database            | 
+temporary           | f
+active              | f
+active_pid          | 
+xmin                | 
+catalog_xmin        | 
+restart_lsn         | 0/9000000 
+confirmed_flush_lsn | 
+wal_status          | reserved
+safe_wal_size       | 
+
+restart_lsn - позиция, с которой реплика будет считывать журнальные файлы при обращении к слоту.
+
+student:~$ pg_basebackup -D /home/student/backup --slot=replica -R 
+
+student:~$ sudo cat /home/student/replication/postgresql.auto.conf
+primary_conninfo = 'user=student passfile=''/home/student/.pgpass'' channel_binding=prefer host=''/var/run/postgresql'' port=5432 sslmode=prefer sslcompression=0 sslsni=1 ssl_min_protocol_version=TLSv1.2 gssencmode=prefer krbsrvname=postgres target_session_attrs=any'
+primary_slot_name = 'replica'
+
+student:~$ sudo ls -la /home/student/replication
+-rw-------  1 student student      0 мар  2 18:46 standby.signal
+
+student:~$ sudo pg_ctlcluster 13 beta stop
+student:~$ sudo rm -rf /var/lib/postgresql/13/beta
+student:~$ sudo mv /home/student/replication /var/lib/postgresql/13/beta
+student:~$ sudo chown -R postgres:postgres /var/lib/postgresql/13/beta
+student:~$ sudo pg_ctlcluster 13 beta start
+
+student:~$ ps -o pid,command --ppid `sudo head -n 1 /var/lib/postgresql/13/beta/postmaster.pid`
+    PID COMMAND
+  10393 postgres: 13/beta: startup recovering 00000001000000000000002A. //применяет записи WAL
+  10394 postgres: 13/beta: checkpointer   // выполняет точки рестарта
+  10395 postgres: 13/beta: background writer // записывает грязные страницы из буферного кэша на диск
+  10396 postgres: 13/beta: stats collector // сбор статистики
+  10397 postgres: 13/beta: walreceiver streaming 0/A0002E0 // получение журнальных записей
+В значении archive_mode=always на реплике поднимается процесс archiver, архивирующий журнальные файлы
+
+student:~$ ps -o pid,command --ppid `sudo head -n 1 /var/lib/postgresql/13/alpha/postmaster.pid`
+    PID COMMAND
+   8748 postgres: 13/alpha: checkpointer // выполняет контрольную точку
+   8749 postgres: 13/alpha: background writer 
+   8750 postgres: 13/alpha: walwriter // создание журналов упреждающей записи
+   8751 postgres: 13/alpha: autovacuum launcher // отчистка мертвых строк
+   8752 postgres: 13/alpha: stats collector 
+   8753 postgres: 13/alpha: logical replication launcher 
+   9036 postgres: 13/alpha: walsender student [local] streaming 0/A0002E0 // передача записей
+
+*********************************| Мониторинг репликации |*******************************************
+pg_current_wal_lsn() - pg_stat_replication.sent_lsn // сильно нагруженный мастер. Процесс wal sender долго не подхватывает журнальную запись
+pg_stat_replication.write_lsn - pg_stat_replication.sent_lsn // проблемы с сетью. Данные между wal sender и wal receiver долго передаются
+pg_stat_replication.replay_lsn - pg_stat_replication.write_lsn // сильно нагруженная реплика. Данные на реплике долго применяются
+
+Режимы репликации synchronous_commit:
+off // трансакция завершается, не дожидаясь попадания данных на диск
+local // трансакция завершается после попадания данных на диск
+remote_write // мастер ожидает подтверждения о получении записи
+on // мастер ожидает подтверждения о попадании журнальной записи на диск реплики
+remote_apply // мастер дожидается применения записи на реплике
