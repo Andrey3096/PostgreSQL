@@ -1,0 +1,107 @@
+****************************************************************************************                            Переключение на реплику                                  *
+***************************************************************************************
+
+Переключение на реплику производится функцией pg_promote(). Для этого он применяет уже полученные журнальные записи, которые еще не были применены. Процессы wal receiver и startup завершаются, а walwriter и autovacuum launcher, наоборот, запускаются.Кроме того, сервер переходит на новую линию времени.
+
+Если мастер был остановлен аварийно, то с большой вероятностью часть файлов журнала не успела дойти до реплики и будет потеряна. Быстро подключить бывший мастер к реплике поможет штатаная утилита pg_rewind. Утилита определяет место расхождения между двумя серверами, определяет ближайшую к нему общую контрольную точку, и, просматривая журнал, определяет все страницы, измененные с момента этой контрольной точки. Найденные страницы (которых должно быть немного) заменяются страницами с сервера-источника (нового мастера). Кроме того, утилита копирует с сервера-источника все служебные файлы. Дальше применяются все необходимые записи WAL с нового мастера. Фактически, это выполняет уже не утилита, а обычный процесс восстановления после запуска сервера. Чтобы восстановление началось с нужного момента, утилита создает управляющий файл backup_label.
+
+На целевом сервере должны быть включены контрольные суммы, а на сервере-источнике  full_page_writes. 
+
+Смоделируем аварийную остановку мастера
+student:~$ sudo head -n 1 /var/lib/postgresql/13/alpha/postmaster.pid
+11291
+student:~$ sudo kill -9 11291
+
+|student:~$ psql -p 5433 -U postgres -c "select pg_create_physical_replication_slot('replica')"
+| pg_create_physical_replication_slot 
+|-------------------------------------
+| (replica,)
+|(1 row)
+
+Если целевой сервер не был остановлен корректно, утилита сначала запустит его в монопольном режиме и остановит с выполнением контрольной точки. Для запуска требуется наличие файла postgresql.conf в PGDATA.
+
+postgres$ touch /var/lib/postgresql/13/alpha/postgresql.conf
+postgres@student:~$ /usr/lib/postgresql/13/bin/pg_rewind -D /var/lib/postgresql/13/alpha --source-server='user=postgres port=5433' -R -P
+pg_rewind: connected to server
+pg_rewind: executing "/usr/lib/postgresql/13/bin/postgres" for target server to complete crash recovery
+2024-03-02 20:37:48.332 GMT [11449] LOG:  database system was interrupted; last known up at 2024-03-02 20:29:29 GMT
+2024-03-02 20:37:48.337 GMT [11449] LOG:  database system was not properly shut down; automatic recovery in progress
+2024-03-02 20:37:48.339 GMT [11449] LOG:  redo starts at 0/A000358
+2024-03-02 20:37:48.340 GMT [11449] LOG:  invalid record length at 0/A0041E0: wanted 24, got 0
+2024-03-02 20:37:48.341 GMT [11449] LOG:  redo done at 0/A0041A8
+
+PostgreSQL stand-alone backend 13.7 (Ubuntu 13.7-1.pgdg22.04+1)
+backend> pg_rewind: servers diverged at WAL location 0/A000358 on timeline 2
+pg_rewind: rewinding from last common checkpoint at 0/A0002E0 on timeline 2
+pg_rewind: reading source file list
+pg_rewind: reading target file list
+pg_rewind: reading WAL in target
+pg_rewind: need to copy 61 MB (total source directory size is 107 MB)
+62972/62972 kB (100%) copied
+pg_rewind: creating backup label and updating control file
+pg_rewind: syncing target data directory
+pg_rewind: Done!
+
+student:~$ sudo cat /var/lib/postgresql/13/alpha/backup_label
+START WAL LOCATION: 0/A0002E0 (file 00000002000000000000000A)
+CHECKPOINT LOCATION: 0/A0002E0
+BACKUP METHOD: pg_rewind
+BACKUP FROM: standby
+START TIME: 2024-03-02 23:37:50 MSK
+
+Ключом -R мы попросили утилиту создать сигнальный файл standby.signal и задать в конфигурационном файле строку соединения.
+
+student:~$ sudo pg_ctlcluster 13 alpha start
+
+*******************************| Архивация с реплики |*********************************
+
+Допустим, при отказе мастера не все сегменты были записаны в архив. Но реплика не в курсе настроек архивирования на мастере. Когда бывшая реплика займет место мастера, она не запишет недостающие сегменты в архив (хотя они у нее есть), потому что рассчитывает на то, что архив работал без сбоев. В результате архив будет неполным.А это означает, что из имеющихся резервных копий можно  восстановить систему только до образовавшейся «дыры». Решением проблемы может быть запуск процесса archiver на реплике.
+
+| postgres=# SELECT pg_create_physical_replication_slot('replica');
+
+SELECT pg_create_physical_replication_slot('replica');
+student$ cat << EOF | sudo -u postgres tee /var/lib/postgresql/13/alpha/postgresql.auto.conf
+primary_conninfo='user=student port=5433'
+primary_slot_name='replica'
+archive_mode='always'
+archive_command='test -f /var/lib/postgresql/archive/%f || cp %p /var/lib/postgresql/archive/%f'
+EOF
+
+student:~$ sudo pg_ctlcluster 13 alpha start
+
+postgres=> ALTER SYSTEM SET archive_command='exit 1';
+postgres=# SELECT pg_reload_conf();
+
+backup=# SELECT pg_walfile_name(pg_current_wal_lsn());
+     pg_walfile_name      
+--------------------------
+ 00000003000000000000000E
+(1 row)
+
+backup=# INSERT INTO t VALUES(1),(2);
+INSERT 0 2
+
+backup=# select pg_switch_wal();
+ pg_switch_wal 
+---------------
+ 0/E002038
+(1 row)
+
+backup=# SELECT               
+        pg_walfile_name(pg_current_wal_lsn()) current_wal,
+        last_archived_wal,
+        last_failed_wal
+FROM pg_stat_archiver;
+       current_wal        | last_archived_wal |     last_failed_wal      
+--------------------------+-------------------+--------------------------
+ 00000003000000000000000F |                   | 00000003000000000000000E
+(1 row)
+
+student:~$ sudo ls -la /var/lib/postgresql/archive
+total 180236
+drwxr-xr-x 2 postgres postgres     4096 мар  3 02:52 .
+drwxr-xr-x 4 postgres postgres     4096 мар  2 23:39 ..
+-rw------- 1 postgres postgres 16777216 мар  3 02:43 00000003000000000000000C
+-rw------- 1 postgres postgres 16777216 мар  3 02:43 00000003000000000000000D
+-rw------- 1 postgres postgres 16777216 мар  3 02:52 00000003000000000000000E
+-rw------- 1 postgres postgres       75 мар  3 02:34 00000003.history
